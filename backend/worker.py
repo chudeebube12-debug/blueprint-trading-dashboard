@@ -8,12 +8,16 @@ import sys
 from typing import List
 
 import websockets
+import socketio
+
+from backend.strategy import EMAStrategy
 
 # Config
 DERIV_WS_URL = os.environ.get("DERIV_WS_URL", "wss://ws.binaryws.com/websockets/v3")
 API_TOKEN = os.environ.get("API_TOKEN")
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "R_100").split(",") if s.strip()]
 LOG_PATH = os.environ.get("LOG_PATH")  # optional path to save logs
+SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "http://localhost:5000")
 
 # Reconnect/backoff settings
 BACKOFF_BASE = 1.0
@@ -21,6 +25,8 @@ BACKOFF_MAX = 60.0
 
 # Graceful shutdown
 shutdown = False
+
+sio = socketio.AsyncClient(reconnection=True, logger=False, engineio_logger=False)
 
 
 def setup_logging():
@@ -45,6 +51,18 @@ def _on_signal(signum, frame):
     shutdown = True
 
 
+async def ensure_sio_connected():
+    """Ensure the socketio client is connected to the backend web server to publish signals."""
+    if sio.connected:
+        return
+    try:
+        logging.info("Connecting to signal server %s", SIGNAL_SERVER_URL)
+        await sio.connect(SIGNAL_SERVER_URL, transports=["websocket"])  # uses socket.io path
+        logging.info("Connected to signal server")
+    except Exception as e:
+        logging.warning("Could not connect to signal server: %s", e)
+
+
 async def authorize(ws: websockets.WebSocketClientProtocol):
     if not API_TOKEN:
         logging.info("No API_TOKEN set; proceeding without authorization (public endpoints only).")
@@ -58,12 +76,12 @@ async def authorize(ws: websockets.WebSocketClientProtocol):
 
 async def subscribe_ticks(ws: websockets.WebSocketClientProtocol, symbols: List[str]):
     for s in symbols:
-        req = {"ticks": s}
+        req = {"ticks": s, "subscribe": 1}
         await ws.send(json.dumps(req))
         logging.info("Sent subscribe request for %s", s)
 
 
-async def consume(ws: websockets.WebSocketClientProtocol):
+async def consume(ws: websockets.WebSocketClientProtocol, strategy: EMAStrategy, symbol: str):
     async for message in ws:
         # Here you can parse, validate, and route messages to storage, metrics, etc.
         try:
@@ -71,9 +89,27 @@ async def consume(ws: websockets.WebSocketClientProtocol):
         except Exception:
             logging.info("Raw message: %s", message)
             continue
-        # Quick filtering example: log tick updates
-        if "tick" in data or "proposal" in data or "error" in data:
-            logging.info("Message: %s", json.dumps(data))
+
+        # Process ticks
+        if "tick" in data and data.get("tick"):
+            tick = data["tick"]
+            # run strategy
+            try:
+                result = strategy.process_tick(tick)
+                # attach symbol
+                result["symbol"] = symbol
+                logging.info("Signal: %s", json.dumps(result))
+                # send to signal server if connected
+                try:
+                    await ensure_sio_connected()
+                    if sio.connected:
+                        await sio.emit("signal", result)
+                except Exception as e:
+                    logging.warning("Failed to emit signal to server: %s", e)
+            except Exception as e:
+                logging.exception("Strategy error: %s", e)
+        elif "error" in data:
+            logging.error("Deriv error: %s", data.get("error"))
         else:
             logging.debug("Message: %s", json.dumps(data))
 
@@ -81,7 +117,7 @@ async def consume(ws: websockets.WebSocketClientProtocol):
             break
 
 
-async def run_once(symbols: List[str]):
+async def run_once(symbols: List[str], strategy: EMAStrategy):
     global shutdown
     async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=20) as ws:
         logging.info("Connected to %s", DERIV_WS_URL)
@@ -91,7 +127,8 @@ async def run_once(symbols: List[str]):
         await subscribe_ticks(ws, symbols)
         # Consume messages until shutdown
         try:
-            await consume(ws)
+            # we assume only one symbol subscription per connection for strategy state clarity; consume handles ticks
+            await consume(ws, strategy, symbols[0])
         except websockets.ConnectionClosed as e:
             logging.warning("Connection closed: %s", e)
             raise
@@ -101,9 +138,15 @@ async def worker_loop():
     backoff = BACKOFF_BASE
     symbols = SYMBOLS if SYMBOLS else ["R_100"]
 
+    # create a strategy per symbol (currently only uses the first symbol's strategy)
+    strategy = EMAStrategy()
+
+    # Attempt to connect sio in background
+    await ensure_sio_connected()
+
     while not shutdown:
         try:
-            await run_once(symbols)
+            await run_once(symbols, strategy)
             # reset backoff after a clean connection
             backoff = BACKOFF_BASE
         except Exception as exc:
@@ -116,6 +159,12 @@ async def worker_loop():
             backoff = min(backoff * 2, BACKOFF_MAX)
 
     logging.info("Worker loop exiting.")
+    # disconnect sio
+    try:
+        if sio.connected:
+            await sio.disconnect()
+    except Exception:
+        pass
 
 
 def main():
