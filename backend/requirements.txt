@@ -1,3 +1,7 @@
 gunicorn
 websockets>=11.0
 requests
+flask
+flask-socketio
+python-socketio
+eventlet
