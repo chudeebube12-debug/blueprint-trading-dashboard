@@ -1,38 +1,139 @@
+import asyncio
+import json
+import logging
 import os
-import time
+import random
 import signal
 import sys
+from typing import List
 
+import websockets
+
+# Config
+DERIV_WS_URL = os.environ.get("DERIV_WS_URL", "wss://ws.binaryws.com/websockets/v3")
 API_TOKEN = os.environ.get("API_TOKEN")
+SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "R_100").split(",") if s.strip()]
+LOG_PATH = os.environ.get("LOG_PATH")  # optional path to save logs
+
+# Reconnect/backoff settings
+BACKOFF_BASE = 1.0
+BACKOFF_MAX = 60.0
+
+# Graceful shutdown
+shutdown = False
 
 
-def _shutdown(signum, frame):
-    print("Shutdown signal received, exiting.")
-    sys.exit(0)
+def setup_logging():
+    level = os.environ.get("LOG_LEVEL", "INFO")
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if LOG_PATH:
+        from logging.handlers import RotatingFileHandler
+
+        handlers.append(RotatingFileHandler(LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3))
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+
+
+def _on_signal(signum, frame):
+    global shutdown
+    logging.info("Signal %s received, shutting down...", signum)
+    shutdown = True
+
+
+async def authorize(ws: websockets.WebSocketClientProtocol):
+    if not API_TOKEN:
+        logging.info("No API_TOKEN set; proceeding without authorization (public endpoints only).")
+        return
+
+    msg = {"authorize": API_TOKEN}
+    await ws.send(json.dumps(msg))
+    resp = await ws.recv()
+    logging.info("Authorize response: %s", resp)
+
+
+async def subscribe_ticks(ws: websockets.WebSocketClientProtocol, symbols: List[str]):
+    for s in symbols:
+        req = {"ticks": s}
+        await ws.send(json.dumps(req))
+        logging.info("Sent subscribe request for %s", s)
+
+
+async def consume(ws: websockets.WebSocketClientProtocol):
+    async for message in ws:
+        # Here you can parse, validate, and route messages to storage, metrics, etc.
+        try:
+            data = json.loads(message)
+        except Exception:
+            logging.info("Raw message: %s", message)
+            continue
+        # Quick filtering example: log tick updates
+        if "tick" in data or "proposal" in data or "error" in data:
+            logging.info("Message: %s", json.dumps(data))
+        else:
+            logging.debug("Message: %s", json.dumps(data))
+
+        if shutdown:
+            break
+
+
+async def run_once(symbols: List[str]):
+    global shutdown
+    async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+        logging.info("Connected to %s", DERIV_WS_URL)
+        # Authorize if token provided
+        await authorize(ws)
+        # Subscribe to symbols
+        await subscribe_ticks(ws, symbols)
+        # Consume messages until shutdown
+        try:
+            await consume(ws)
+        except websockets.ConnectionClosed as e:
+            logging.warning("Connection closed: %s", e)
+            raise
+
+
+async def worker_loop():
+    backoff = BACKOFF_BASE
+    symbols = SYMBOLS if SYMBOLS else ["R_100"]
+
+    while not shutdown:
+        try:
+            await run_once(symbols)
+            # reset backoff after a clean connection
+            backoff = BACKOFF_BASE
+        except Exception as exc:
+            logging.exception("Worker error: %s", exc)
+            if shutdown:
+                break
+            sleep_for = backoff + random.random()
+            logging.info("Reconnecting in %.1f seconds...", sleep_for)
+            await asyncio.sleep(sleep_for)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+
+    logging.info("Worker loop exiting.")
 
 
 def main():
     if not API_TOKEN:
-        print("API_TOKEN not set — worker will exit.")
-        return
+        logging.warning("API_TOKEN is not set. The worker will still attempt public subscriptions if supported.")
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+    setup_logging()
 
-    print("Deriv worker starting (placeholder).")
-    print("API_TOKEN set:", 'yes' if API_TOKEN else 'no')
+    # Signal handling for graceful shutdown
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
 
-    # Replace this loop with real Deriv streaming logic
+    logging.info("Starting Deriv streaming worker. Symbols: %s", ",".join(SYMBOLS))
+
     try:
-        while True:
-            print("Worker heartbeat — connect to Deriv API here")
-            # Example place: open websocket, authenticate with API_TOKEN, stream ticks, handle reconnects
-            time.sleep(30)
-    except SystemExit:
-        print("Worker exiting cleanly.")
-    except Exception as e:
-        print("Worker error:", e)
-        # Optionally add retry/backoff here
+        asyncio.run(worker_loop())
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt received, exiting")
 
 
 if __name__ == "__main__":
