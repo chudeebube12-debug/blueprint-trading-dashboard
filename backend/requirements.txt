@@ -1,0 +1,3 @@
+gunicorn
+websockets>=11.0
+requests
