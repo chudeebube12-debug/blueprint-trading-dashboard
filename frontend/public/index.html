@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Deriv Tracker Full UI (EMA Signals)</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px; }
+    h2 { color: #333; }
+    #status { margin-bottom: 10px; font-weight: bold; }
+    #lastPrice { font-size: 28px; color: green; }
+    .controls { margin-top: 15px; }
+    button { margin: 5px; padding: 10px 15px; cursor: pointer; }
+    #signal { font-size: 20px; color: blue; margin-top: 10px; }
+    #countdown { font-size: 18px; color: red; }
+    .small { font-size: 13px; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>Deriv Tracker (Client-side EMA Signals)</h2>
+  <div id="status">Not connected</div>
+  <div>Last Price: <span id="lastPrice">---</span></div>
+  <div id="signal">Signal: ---</div>
+  <div id="emas" class="small">Short EMA: ---, Long EMA: ---</div>
+  <div id="countdown">Next signal in: ---</div>
+
+  <div class="controls">
+    <label>Symbol: <input id="symbol" value="R_75" /></label>
+    <label>Short EMA length: <input id="shortLen" type="number" value="5" min="1" style="width:60px" /></label>
+    <label>Long EMA length: <input id="longLen" type="number" value="20" min="1" style="width:60px" /></label>
+    <br/>
+    <button onclick="startAnalysis()">Start Analysis</button>
+    <button onclick="stopAnalysis()">Stop Analysis</button>
+    <button onclick="predictSignal()">Predict Signal</button>
+  </div>
+
+  <script>
+    // Connection + state
+    let ws;
+    let running = false;
+    let countdownInterval;
+    let priceHistory = []; // raw prices
+    const maxHistory = 500;
+
+    function alphaFromLen(n) {
+      return 2 / (n + 1);
+    }
+
+    function calculateEMA(prevEma, price, alpha) {
+      if (prevEma === null) return price;
+      return alpha * price + (1 - alpha) * prevEma;
+    }
+
+    let shortEMA = null;
+    let longEMA = null;
+
+    function updateEMAs(price, shortLen, longLen) {
+      const shortAlpha = alphaFromLen(shortLen);
+      const longAlpha = alphaFromLen(longLen);
+      shortEMA = calculateEMA(shortEMA, price, shortAlpha);
+      longEMA = calculateEMA(longEMA, price, longAlpha);
+      document.getElementById("emas").innerText = `Short EMA: ${shortEMA !== null ? shortEMA.toFixed(5) : '---'}, Long EMA: ${longEMA !== null ? longEMA.toFixed(5) : '---'}`;
+    }
+
+    function computeSignal() {
+      if (shortEMA === null || longEMA === null) return 'HOLD';
+      if (shortEMA > longEMA) return 'BUY';
+      if (shortEMA < longEMA) return 'SELL';
+      return 'HOLD';
+    }
+
+    function startAnalysis() {
+      if (running) return;
+      running = true;
+      document.getElementById("status").innerText = "Connecting...";
+      const symbol = document.getElementById("symbol").value || 'R_75';
+      ws = new WebSocket("wss://ws.binaryws.com/websockets/v3?app_id=1089");
+
+      ws.onopen = () => {
+        document.getElementById("status").innerText = "Connected. Subscribing to ticks...";
+        // subscribe to ticks for chosen symbol
+        ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+        startCountdown();
+      };
+
+      ws.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.tick && data.tick.quote) {
+            const price = parseFloat(data.tick.quote);
+            if (!isFinite(price)) return;
+            document.getElementById("lastPrice").innerText = price.toFixed(5);
+            // maintain history
+            priceHistory.push(price);
+            if (priceHistory.length > maxHistory) priceHistory.shift();
+            // update EMAs
+            const shortLen = Math.max(1, parseInt(document.getElementById("shortLen").value || '5'));
+            const longLen  = Math.max(1, parseInt(document.getElementById("longLen").value || '20'));
+            // initialize if first run: seed EMAs with simple average of initial window if available
+            if (shortEMA === null || longEMA === null) {
+              // seed from last longLen values if available
+              const seedWindow = priceHistory.slice(-Math.max(longLen, shortLen));
+              if (seedWindow.length >= 1) {
+                const avg = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
+                shortEMA = avg(seedWindow.slice(-shortLen));
+                longEMA = avg(seedWindow.slice(-longLen));
+              }
+            } else {
+              updateEMAs(price, shortLen, longLen);
+            }
+            // compute and display signal
+            const signal = computeSignal();
+            const sigEl = document.getElementById("signal");
+            sigEl.innerText = "Signal: " + signal;
+            sigEl.style.color = (signal === 'BUY') ? 'green' : (signal === 'SELL') ? 'red' : 'blue';
+          } else if (data.error) {
+            console.error("Deriv error: ", data.error);
+          }
+        } catch (e) {
+          console.error("Error parsing message", e);
+        }
+      };
+
+      ws.onclose = () => {
+        document.getElementById("status").innerText = "Disconnected";
+        running = false;
+        stopCountdown();
+      };
+
+      ws.onerror = (e) => {
+        console.error("WebSocket error", e);
+      };
+    }
+
+    function stopAnalysis() {
+      if (ws) ws.close();
+      running = false;
+      document.getElementById("status").innerText = "Stopped";
+      stopCountdown();
+    }
+
+    function predictSignal() {
+      const priceText = document.getElementById("lastPrice").innerText;
+      const price = parseFloat(priceText);
+      if (!price || isNaN(price)) {
+        document.getElementById("signal").innerText = "Signal: ---";
+        return;
+      }
+      const signal = computeSignal();
+      document.getElementById("signal").innerText = "Signal: " + signal;
+    }
+
+    function startCountdown() {
+      let seconds = 10;
+      document.getElementById("countdown").innerText = "Next signal in: " + seconds + "s";
+      countdownInterval = setInterval(() => {
+        seconds--;
+        document.getElementById("countdown").innerText = "Next signal in: " + seconds + "s";
+        if (seconds <= 0) {
+          predictSignal();
+          seconds = 10; // reset
+        }
+      }, 1000);
+    }
+
+    function stopCountdown() {
+      clearInterval(countdownInterval);
+      document.getElementById("countdown").innerText = "Next signal in: ---";
+    }
+  </script>
+</body>
+</html>
